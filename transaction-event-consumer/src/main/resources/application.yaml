@@ -192,7 +192,7 @@ rules-engine:
       description: "Gambling MCC transaction between midnight and 5am"
       owner: fraud-team
       enabled: true
-      score: 50
+      score: 40
       condition:
         all:
           - field: merchantCategoryCode
