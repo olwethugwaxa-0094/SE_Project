@@ -1,0 +1,100 @@
+flowchart TD
+    PROD(["Transaction Producers\n(core banking / payments)"])
+    TOPIC_IN[["Kafka: transaction-events\nkeyed by cifNr"]]
+    CONFIG(["application.yaml (local)\nSpring Cloud Config (deployed)\nrules · score-threshold · git-backed"])
+    BUS[["Kafka: Spring Cloud Bus\nRefreshRemoteApplicationEvent\n(deployed only)"]]
+
+subgraph ENGINE["transaction-event-consumer (Spring Boot)"]
+CONSUMER["TransactionEventConsumer\n@KafkaListener\n1 · generate correlationId\n2 · INSERT src_transaction_event"]
+VALIDATOR["TransactionEventValidator\n1 · SHA-256 checksum\n2 · deserialize JSON\n3 · required-field checks\nreturns ValidationResult"]
+
+SRC_AUDIT[("src_transaction_event\nappend-only · source mirror only\nkafka_key · topic · partition\noffset · raw_payload · received_at")]
+
+PROC["TransactionProcessingService\nreceives ValidationResult + correlationId\n─────────────────────────\nInvalid → fail fast:\n  save fact_transaction (status = INVALID)\n  transactionId = kafka key (fallback)\n  score = 100\n  matchedRules = [VALIDATION_FAILURE]\n  ruleSetVersion = SYSTEM\n  degradedMode = false\n─────────────────────────\nValid → full flow:\n  1 · idempotency check\n  2 · resolve dimensions\n  3 · save fact_transaction (status = VALID)\n  4 · build eval context\n  5 · evaluate rules"]
+
+DIM["DimensionResolutionService\nresolve/create SCD-2 dims"]
+DW[("Postgres DW\nfact_transaction\n  + status (VALID / INVALID)\n  + correlation_id\ndim_client · dim_account\ndim_merchant · dim_channel\ndim_transaction_auth\ndim_blacklisted_merchant")]
+
+subgraph RULES["Rules Engine (new)"]
+REFRESH["RuleSetRefreshListener\n@RefreshScope\nvalidates before swap\n(deployed only)"]
+RULESET["AtomicReference#lt;RuleSet#gt;\nversion = git SHA\nscore-threshold from config"]
+CTX["EvaluationContextBuilder\nflat projection of TransactionEvent\n+ hourOfDay · dayOfWeek\n+ isBlacklisted · recentTxnCount*"]
+EVAL["ConditionEvaluator\nAND · OR · NOT · Leaf · SpEL"]
+end
+
+VELOCITY["VelocityService\nprimary: Redis ZADD · ZCOUNT\nfallback: DW COUNT query\n─────────────────────────\nsafeguards:\n  circuit breaker (Resilience4j)\n  separate Postgres pool\n  50ms hard timeout per query\n  sets degradedMode = true"]
+
+SCORED["ScoredEventProducer\ntwo callers · same output contract:\n  EVAL → full scored event\n  PROC invalid path → synthetic\n─────────────────────────\n1 · idempotency check on correlation_id\n2 · persist fact_scored_transaction\n3 · publish transaction.scored\n(dual-write: DB first, then Kafka)\ncorrelationId propagated throughout"]
+
+SCORED_DW[("Postgres DW\nfact_scored_transaction\ncorrelation_id (unique constraint)\ntransaction_id · kafka_key · cifNr\nscore · matched_rules\nrule_set_version · degraded_mode\nrouted_to · scored_at")]
+
+METRICS["RulesEngineMetrics (Micrometer)\n─────────────────────────\nCONSUMER: consumer lag · deser failures\nVALIDATOR: duration · failures by category\nPROC: duration · idempotency skips\nRULES: eval duration · per-rule match rate\nVELOCITY: query duration · fallback count\nSCORED: persist + publish duration"]
+end
+
+REDIS[("Redis\nrules:velocity:{cifNr}\nsorted sets · sliding window")]
+TOPIC_DLQ[["Kafka: transaction.dlq\ndeserializer failures\n+ retry exhaustion"]]
+TOPIC_SCORED[["Kafka: transaction.scored\ncorrelationId · txn + score\nmatchedRules · ruleSetVersion\ndegradedMode"]]
+TOPIC_APPROVED[["Kafka: transaction.approved\ndownstream consumer\nfilters score below threshold"]]
+TOPIC_REVIEW[["Kafka: transaction.review\ndownstream consumer\nfilters score at or above threshold\n(includes validation failures at 100)"]]
+
+CASE(["Case Management\nsubscribes to .review"])
+NOTIF(["Notifications\nsubscribes to .review (ops alerts)\nand .approved (customer alerts)"])
+ANALYTICS(["Analytics\nsubscribes to .scored\nfull audit + ML training data"])
+
+PROD --> TOPIC_IN
+TOPIC_IN --> CONSUMER
+
+CONSUMER -->|"INSERT raw source only\n(no correlationId)"| SRC_AUDIT
+CONSUMER --> VALIDATOR
+VALIDATOR -->|"ValidationResult\nValid or Invalid"| PROC
+
+PROC -->|"both paths:\nsave fact_transaction\nwith status + correlationId"| DW
+PROC -->|"Valid only"| DIM
+DIM --> DW
+PROC -->|"Valid only"| CTX
+CTX -->|"isBlacklisted lookup\ndim_blacklisted_merchant"| DW
+CTX --> VELOCITY
+VELOCITY <-->|"primary path"| REDIS
+VELOCITY -. "Redis circuit open:\nfallback COUNT query\nseparate pool · 50ms timeout" .-> DW
+CTX --> EVAL
+EVAL --> RULESET
+EVAL --> SCORED
+PROC -->|"Invalid path\nsynthetic scored event"| SCORED
+
+SCORED -->|"1 · idempotency check\n2 · persist\n(dual-write guard)"| SCORED_DW
+SCORED -->|"3 · publish after\nDB write succeeds"| TOPIC_SCORED
+
+TOPIC_SCORED --> TOPIC_APPROVED
+TOPIC_SCORED --> TOPIC_REVIEW
+TOPIC_SCORED --> ANALYTICS
+TOPIC_REVIEW --> CASE
+TOPIC_REVIEW --> NOTIF
+TOPIC_APPROVED --> NOTIF
+
+CONSUMER -.->|"emits"| METRICS
+VALIDATOR -.->|"emits"| METRICS
+PROC -.->|"emits"| METRICS
+VELOCITY -.->|"emits"| METRICS
+SCORED -.->|"emits"| METRICS
+RULES -.->|"emits"| METRICS
+
+CONFIG -. "local: application.yaml\ndeployed: Spring Cloud Config" .-> RULESET
+CONFIG -.->|"deployed only"| BUS
+BUS -.->|"deployed only"| REFRESH
+REFRESH --> RULESET
+
+TOPIC_IN -.->|"DeadLetterPublishingRecoverer\n(existing KafkaConsumerConfig)"| TOPIC_DLQ
+
+classDef kafka fill:#EEEDFE,stroke:#534AB7,color:#26215C
+classDef store fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
+classDef service fill:#E6F1FB,stroke:#185FA5,color:#042C53
+classDef external fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
+classDef config fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+classDef new fill:#FFF9E6,stroke:#B8860B,color:#3B2A00
+
+class TOPIC_IN,TOPIC_DLQ,TOPIC_REVIEW,TOPIC_APPROVED,TOPIC_SCORED,BUS kafka
+class DW,REDIS,SRC_AUDIT,SCORED_DW store
+class CONSUMER,VALIDATOR,PROC,DIM,SCORED,METRICS,VELOCITY service
+class PROD,CASE,NOTIF,ANALYTICS external
+class CONFIG,REFRESH config
+class RULES,CTX,EVAL,RULESET new

@@ -1,0 +1,70 @@
+[
+  {
+    "transactionEventId": null,
+    "transactionEventType": "NEW",
+    "transactionMetadata": {
+      "transactionId": "TXN-98234510B",
+      "transactionDate": "2023-10-27T14:22:01",
+      "postingDate": "2023-10-27",
+      "amount": 125.50,
+      "balance": 4520.75
+    },
+    "paymentDetails": {
+      "channel": "POS",
+      "trancode": 4001,
+      "trantypedesc": "POS Purchase",
+      "moneyIn": false,
+      "cardNr": "************4412"
+    },
+    "merchantData": {
+      "merchantName": "Blanda-Schaefer",
+      "merchantDesc": "Office Supplies Co",
+      "merchantCategoryCode": 5943,
+      "city": "Washington",
+      "province": "DC"
+    },
+    "clientData": {
+      "cifNr": 773210,
+      "accountNr": 6201234567,
+      "branch": 251
+    },
+    "authentication": {
+      "authTraceId": "091225",
+      "cardAuthStatus": "APPROVED"
+    }
+  },
+  {
+    "transactionEventId": null,
+    "transactionEventType": "NEW",
+    "transactionMetadata": {
+      "transactionId": "TXN-10293847A",
+      "transactionDate": "2023-10-27T08:15:33",
+      "postingDate": "2023-10-27",
+      "amount": 250.00,
+      "balance": 12500.00
+    },
+    "paymentDetails": {
+      "channel": "POS",
+      "trancode": 4001,
+      "trantypedesc": "POS Purchase",
+      "moneyIn": false,
+      "cardNr": "************1234"
+    },
+    "merchantData": {
+      "merchantName": "Shoprite Holdings",
+      "merchantDesc": "Shoprite Supermarket",
+      "merchantCategoryCode": 5411,
+      "city": "Cape Town",
+      "province": "Western Cape"
+    },
+    "clientData": {
+      "cifNr": 100002,
+      "accountNr": 4000000002,
+      "branch": 1001
+    },
+    "authentication": {
+      "authTraceId": "283746",
+      "cardAuthStatus": "APPROVED"
+    }
+  }
+]

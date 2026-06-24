@@ -1,0 +1,275 @@
+##################################################################################
+# Application
+##################################################################################
+
+
+server:
+  port: 8081
+
+spring:
+  application:
+    name: transaction-event-consumer
+
+  datasource:
+    # reWriteBatchedInserts=true: rewrites Hibernate's JDBC batches into
+    # single multi-row INSERTs on the wire. Required for batch_size below
+    # to actually batch. 2-5x throughput improvement on bulk inserts.
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/connect_dev?reWriteBatchedInserts=true}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+      # Catch connection leaks early — warn if a connection is held >60s.
+      # A leak in a 24/7 consumer surfaces at 2am in prod; catch it in dev.
+      leak-detection-threshold: 60000
+      validation-timeout: 5000
+
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+    validate-on-migrate: true
+    table: flyway_schema_history_tec
+    schemas: rules_engine
+
+  #################################################################################
+  # Kafka AutoConfiguration
+  #################################################################################
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:19092,localhost:29092,localhost:39092}
+    topics:
+      source: "transaction-events"
+      dlq: "transaction.dlq"
+      review: "transaction.review"
+      approved: "transaction.approved"
+      scored: "transaction.scored"
+
+    listener:
+      concurrency: 3
+    consumer:
+      # Steady consumption: small polls, low wait time. Avoid accumulating
+      # large polls that delay processing and inflate consumer lag on restart.
+      max-poll-records: 100
+      fetch-min-size: 1
+      fetch-max-wait: 100
+      group-id: transaction-event-consumer-group
+      auto-offset-reset: earliest
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        retries: 3
+
+  ##################################################################################
+  # Redis
+  ##################################################################################
+
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:127.0.0.1}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      username: ${SPRING_DATA_REDIS_USERNAME:admin}
+      password: ${SPRING_DATA_REDIS_PASSWORD:pass123}
+      timeout: 1000ms
+
+##################################################################################
+# Actuator / Metrics
+##################################################################################
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
+##################################################################################
+# Rules Engine
+##################################################################################
+
+rules-engine:
+  score-threshold: 70
+  version: local
+  rules:
+    - id: HIGH_AMOUNT_ONLINE
+      description: "Large online transaction"
+      owner: fraud-team
+      enabled: true
+      score: 70
+      condition:
+        all:
+          - { field: amount, op: GTE, value: 5000 }
+          - { field: channel, op: EQUALS, value: "ONLINE" }
+
+    - id: MID_AMOUNT_ONLINE
+      description: "Mid value online transaction"
+      owner: fraud-team
+      enabled: true
+      score: 40
+      condition:
+        all:
+          - { field: amount, op: GTE, value: 2500 }
+          - { field: channel, op: EQUALS, value: "ONLINE" }
+
+    - id: BLACKLISTED_MERCHANT
+      description: "Transaction at a blacklisted merchant"
+      owner: fraud-team
+      enabled: true
+      score: 80
+      condition:
+        all:
+          - { field: isBlacklisted, op: EQUALS, value: true }
+
+    - id: MID_VELOCITY_SPIKE_10M
+      description: "More than 3 transactions from this client in last 10 minutes"
+      owner: fraud-team
+      enabled: true
+      score: 50
+      condition:
+        all:
+          - { field: recentTxnCount10m, op: GT, value: 3 }
+
+    - id: HIGH_VELOCITY_SPIKE_10M
+      description: "More than 5 transactions from this client in last 10 minutes"
+      owner: fraud-team
+      enabled: true
+      score: 80
+      condition:
+        all:
+          - { field: recentTxnCount10m, op: GT, value: 5 }
+
+    - id: DECLINED_CARD_AUTH_STATUS
+      description: "Transaction that was declined"
+      owner: fraud-team
+      enabled: true
+      score: 40
+      condition:
+        all:
+          - { field: cardAuthStatus, op: EQUALS, value: "DECLINED" }
+
+    - id: REVERSED_CARD_AUTH_STATUS
+      description: "Transaction that was reversed"
+      owner: fraud-team
+      enabled: true
+      score: 80
+      condition:
+        all:
+          - { field: cardAuthStatus, op: EQUALS, value: "REVERSED" }
+
+    - id: ODD_HOURS_GAMBLING_MCC
+      description: "Gambling MCC transaction between midnight and 5am"
+      owner: fraud-team
+      enabled: true
+      score: 50
+      condition:
+        all:
+          - field: merchantCategoryCode
+            op: IN
+            values:
+              - 7993
+              - 7995
+              - 7801
+          - field: hourOfDay
+            op: BETWEEN
+            values:
+              - 0
+              - 5
+
+    - id: ONLINE_TRANSACTION
+      description: "Flagging online transactions"
+      owner: fraud-team
+      enabled: true
+      score: 20
+      condition:
+        all:
+          - { field: channel, op: EQUALS, value: "ONLINE" }
+
+    - id: ATM_TRANSACTION
+      description: "Flagging ATM transactions"
+      owner: fraud-team
+      enabled: true
+      score: 20
+      condition:
+        all:
+          - { field: channel, op: EQUALS, value: "ATM" }
+
+    - id: CASHSEND_TRANSACTION
+      description: "Flagging CASHSEND transactions"
+      owner: fraud-team
+      enabled: true
+      score: 20
+      condition:
+        all:
+          - { field: channel, op: EQUALS, value: "CASHSEND" }
+
+
+##################################################################################
+# Velocity service
+##################################################################################
+
+velocity:
+  redis:
+    enabled: true
+  fallback:
+    datasource:
+      jdbc-url: ${spring.datasource.url}
+      username: ${spring.datasource.username}
+      password: ${spring.datasource.password}
+      maximum-pool-size: 3
+      connection-timeout: 2000
+      pool-name: velocity-fallback
+
+##################################################################################
+# Resilience4j circuit breaker (velocity → Redis)
+##################################################################################
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      velocity:
+        register-health-indicator: true
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+
+##################################################################################
+# Logging
+##################################################################################
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"

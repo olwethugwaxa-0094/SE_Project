@@ -1,0 +1,66 @@
+[
+  {
+    "transactionMetadata": {
+      "transactionId": "TXN-98234510B",
+      "timestamp": "2023-10-27T14:22:01Z",
+      "status": "APPROVED",
+      "amount": 125.50,
+      "currency": "ZAR"
+    },
+    "paymentDetails": {
+      "paymentMethod": "CREDIT_CARD",
+      "cardNetwork": "MASTERCARD",
+      "cardLast4": "4412",
+      "entryMode": "EMV_CHIP",
+      "isFraudulent": false
+    },
+    "merchantData": {
+      "merchantId": "MID-773210",
+      "merchantName": "Blanda-Schaefer",
+      "merchantCategory": "Office Supplies",
+      "merchantAddress": "1745 T Street Southeast, Washington"
+    },
+    "clientData": {
+      "customerId": 1,
+      "customerName": "Terry Medhurst",
+      "customerEmail": "atuny0@sohu.com",
+      "customerPhone": "+63 791 675 8914"
+    },
+    "authentication": {
+      "authCode": "091225",
+      "responseCode": "00"
+    }
+  },
+  {
+    "transactionMetadata": {
+      "transactionId": "TXN-10293847A",
+      "timestamp": "2023-10-27T08:15:33Z",
+      "status": "APPROVED",
+      "amount": 250.00,
+      "currency": "ZAR"
+    },
+    "paymentDetails": {
+      "paymentMethod": "DEBIT_CARD",
+      "cardNetwork": "VISA",
+      "cardLast4": "1234",
+      "entryMode": "CONTACTLESS",
+      "isFraudulent": false
+    },
+    "merchantData": {
+      "merchantId": "MID-112233",
+      "merchantName": "Shoprite Holdings",
+      "merchantCategory": "Groceries",
+      "merchantAddress": "15 Christiaan Barnard St, Cape Town"
+    },
+    "clientData": {
+      "customerId": 2,
+      "customerName": "Sheldon Quigley",
+      "customerEmail": "hbingley1@plala.or.jp",
+      "customerPhone": "+27 82 345 6789"
+    },
+    "authentication": {
+      "authCode": "283746",
+      "responseCode": "00"
+    }
+  }
+]
