@@ -1,100 +1,201 @@
 flowchart TD
-    PROD(["Transaction Producers\n(core banking / payments)"])
-    TOPIC_IN[["Kafka: transaction-events\nkeyed by cifNr"]]
-    CONFIG(["application.yaml (local)\nSpring Cloud Config (deployed)\nrules · score-threshold · git-backed"])
-    BUS[["Kafka: Spring Cloud Bus\nRefreshRemoteApplicationEvent\n(deployed only)"]]
+    subgraph PRODUCER["transaction-producer"]
+        direction TB
+        RestAPI["REST POST /v1/transactionevent"]
+        TxnRepo["TransactionRepository<br/>(payments.transactions)"]
+        TxnMapper["TransactionEventMapper<br/>(to TransactionEvent)"]
+        TxnProducer["TransactionEventProducer<br/>(sort by transactionDate ASC)<br/>SHA-256 checksum header"]
+        KafkaProducerCfg["KafkaProducerConfig<br/>(acks=all, idempotence)"]
+        AutoCreateCfg["AutoCreateConfig<br/>(creates transaction-events topic)"]
 
-subgraph ENGINE["transaction-event-consumer (Spring Boot)"]
-CONSUMER["TransactionEventConsumer\n@KafkaListener\n1 · generate correlationId\n2 · INSERT src_transaction_event"]
-VALIDATOR["TransactionEventValidator\n1 · SHA-256 checksum\n2 · deserialize JSON\n3 · required-field checks\nreturns ValidationResult"]
+        RestAPI --> TxnProducer
+        TxnRepo --> TxnMapper
+        TxnMapper --> TxnProducer
+        KafkaProducerCfg -.configures.-> TxnProducer
+        AutoCreateCfg -.creates.-> KafkaTopic1
+    end
 
-SRC_AUDIT[("src_transaction_event\nappend-only · source mirror only\nkafka_key · topic · partition\noffset · raw_payload · received_at")]
+    subgraph CONSUMER["transaction-event-consumer"]
+        direction TB
 
-PROC["TransactionProcessingService\nreceives ValidationResult + correlationId\n─────────────────────────\nInvalid → fail fast:\n  save fact_transaction (status = INVALID)\n  transactionId = kafka key (fallback)\n  score = 100\n  matchedRules = [VALIDATION_FAILURE]\n  ruleSetVersion = SYSTEM\n  degradedMode = false\n─────────────────────────\nValid → full flow:\n  1 · idempotency check\n  2 · resolve dimensions\n  3 · save fact_transaction (status = VALID)\n  4 · build eval context\n  5 · evaluate rules"]
+        KafkaConsumerCfg["KafkaConsumerConfig<br/>(ExponentialBackOff, 3 retries)<br/>DLQ on failure"]
+        KafkaListener["@KafkaListener<br/>(generates correlationId)"]
 
-DIM["DimensionResolutionService\nresolve/create SCD-2 dims"]
-DW[("Postgres DW\nfact_transaction\n  + status (VALID / INVALID)\n  + correlation_id\ndim_client · dim_account\ndim_merchant · dim_channel\ndim_transaction_auth\ndim_blacklisted_merchant")]
+        SrcMapper["SrcTransactionEventMapper<br/>(Kafka metadata + payload)"]
+        SrcRepo["SrcTransactionEventRepository<br/>(unique: topic+partition+offset)"]
 
-subgraph RULES["Rules Engine (new)"]
-REFRESH["RuleSetRefreshListener\n@RefreshScope\nvalidates before swap\n(deployed only)"]
-RULESET["AtomicReference#lt;RuleSet#gt;\nversion = git SHA\nscore-threshold from config"]
-CTX["EvaluationContextBuilder\nflat projection of TransactionEvent\n+ hourOfDay · dayOfWeek\n+ isBlacklisted · recentTxnCount*"]
-EVAL["ConditionEvaluator\nAND · OR · NOT · Leaf · SpEL"]
-end
+        Validator["TransactionEventValidator<br/>(checksum → deserialize → fields)"]
 
-VELOCITY["VelocityService\nprimary: Redis ZADD · ZCOUNT\nfallback: DW COUNT query\n─────────────────────────\nsafeguards:\n  circuit breaker (Resilience4j)\n  separate Postgres pool\n  50ms hard timeout per query\n  sets degradedMode = true"]
+        TxnProcSvc["TransactionProcessingService<br/>(routes Valid/Invalid)"]
 
-SCORED["ScoredEventProducer\ntwo callers · same output contract:\n  EVAL → full scored event\n  PROC invalid path → synthetic\n─────────────────────────\n1 · idempotency check on correlation_id\n2 · persist fact_scored_transaction\n3 · publish transaction.scored\n(dual-write: DB first, then Kafka)\ncorrelationId propagated throughout"]
+        InvalidPath["processInvalid"]
+        FactTxnRepoInvalid["FactTransactionRepository<br/>(save INVALID, no dims)"]
 
-SCORED_DW[("Postgres DW\nfact_scored_transaction\ncorrelation_id (unique constraint)\ntransaction_id · kafka_key · cifNr\nscore · matched_rules\nrule_set_version · degraded_mode\nrouted_to · scored_at")]
+        ValidPath["processValid"]
+        DimResSvc["DimensionResolutionService<br/>(resolve 6 SCD-2 dims)"]
+        FactTxnRepoValid["FactTransactionRepository<br/>(save VALID with dims)"]
 
-METRICS["RulesEngineMetrics (Micrometer)\n─────────────────────────\nCONSUMER: consumer lag · deser failures\nVALIDATOR: duration · failures by category\nPROC: duration · idempotency skips\nRULES: eval duration · per-rule match rate\nVELOCITY: query duration · fallback count\nSCORED: persist + publish duration"]
-end
+        EvalCtxBuilder["EvaluationContextBuilder<br/>(flat context: velocity + blacklist + time)"]
 
-REDIS[("Redis\nrules:velocity:{cifNr}\nsorted sets · sliding window")]
-TOPIC_DLQ[["Kafka: transaction.dlq\ndeserializer failures\n+ retry exhaustion"]]
-TOPIC_SCORED[["Kafka: transaction.scored\ncorrelationId · txn + score\nmatchedRules · ruleSetVersion\ndegradedMode"]]
-TOPIC_APPROVED[["Kafka: transaction.approved\ndownstream consumer\nfilters score below threshold"]]
-TOPIC_REVIEW[["Kafka: transaction.review\ndownstream consumer\nfilters score at or above threshold\n(includes validation failures at 100)"]]
+        subgraph RULES["Rules Engine"]
+            direction TB
+            RulesEngProps["RulesEngineProperties<br/>@ConfigurationProperties<br/>(rules-engine.*)"]
+            RuleSetLoader["RuleSetLoader<br/>(parse conditions)"]
+            RuleSetValidator["RuleSetValidator<br/>(validate fields/operators)"]
+            RulesEngine["RulesEngine<br/>(AtomicReference<RuleSet>)<br/>(evaluate active rules)"]
+            RulesRefreshListener["RulesRefreshListener<br/>(EnvironmentChangeEvent)<br/>(hot-reload)"]
+            ConditionEval["ConditionEvaluator<br/>(AND/OR/NOT/Leaf/SpEL)"]
 
-CASE(["Case Management\nsubscribes to .review"])
-NOTIF(["Notifications\nsubscribes to .review (ops alerts)\nand .approved (customer alerts)"])
-ANALYTICS(["Analytics\nsubscribes to .scored\nfull audit + ML training data"])
+            RulesEngProps -.provides.-> RuleSetLoader
+            RuleSetLoader --> RuleSetValidator
+            RuleSetValidator --> RulesEngine
+            RulesRefreshListener -.reloads.-> RulesEngine
+            RulesEngine --> ConditionEval
+        end
 
-PROD --> TOPIC_IN
-TOPIC_IN --> CONSUMER
+        ScoredEvtProducer["ScoredEventProducer<br/>(idempotency: correlationId)<br/>(dual-write: DB then Kafka)"]
+        FactScoredRepo["FactScoredTransactionRepository<br/>(unique: correlation_id)"]
 
-CONSUMER -->|"INSERT raw source only\n(no correlationId)"| SRC_AUDIT
-CONSUMER --> VALIDATOR
-VALIDATOR -->|"ValidationResult\nValid or Invalid"| PROC
+        Router["Route by score threshold"]
 
-PROC -->|"both paths:\nsave fact_transaction\nwith status + correlationId"| DW
-PROC -->|"Valid only"| DIM
-DIM --> DW
-PROC -->|"Valid only"| CTX
-CTX -->|"isBlacklisted lookup\ndim_blacklisted_merchant"| DW
-CTX --> VELOCITY
-VELOCITY <-->|"primary path"| REDIS
-VELOCITY -. "Redis circuit open:\nfallback COUNT query\nseparate pool · 50ms timeout" .-> DW
-CTX --> EVAL
-EVAL --> RULESET
-EVAL --> SCORED
-PROC -->|"Invalid path\nsynthetic scored event"| SCORED
+        TopicConfig["TopicConfig<br/>(creates scored/approved/review/dlq)"]
 
-SCORED -->|"1 · idempotency check\n2 · persist\n(dual-write guard)"| SCORED_DW
-SCORED -->|"3 · publish after\nDB write succeeds"| TOPIC_SCORED
+        KafkaConsumerCfg -.configures.-> KafkaListener
+        KafkaListener --> SrcMapper
+        SrcMapper --> SrcRepo
+        SrcRepo --> Validator
+        Validator --> TxnProcSvc
 
-TOPIC_SCORED --> TOPIC_APPROVED
-TOPIC_SCORED --> TOPIC_REVIEW
-TOPIC_SCORED --> ANALYTICS
-TOPIC_REVIEW --> CASE
-TOPIC_REVIEW --> NOTIF
-TOPIC_APPROVED --> NOTIF
+        TxnProcSvc -->|Invalid| InvalidPath
+        InvalidPath --> FactTxnRepoInvalid
+        FactTxnRepoInvalid --> ScoredEvtProducer
 
-CONSUMER -.->|"emits"| METRICS
-VALIDATOR -.->|"emits"| METRICS
-PROC -.->|"emits"| METRICS
-VELOCITY -.->|"emits"| METRICS
-SCORED -.->|"emits"| METRICS
-RULES -.->|"emits"| METRICS
+        TxnProcSvc -->|Valid| ValidPath
+        ValidPath --> DimResSvc
+        DimResSvc --> FactTxnRepoValid
+        FactTxnRepoValid --> EvalCtxBuilder
+        EvalCtxBuilder --> RulesEngine
+        RulesEngine --> ScoredEvtProducer
 
-CONFIG -. "local: application.yaml\ndeployed: Spring Cloud Config" .-> RULESET
-CONFIG -.->|"deployed only"| BUS
-BUS -.->|"deployed only"| REFRESH
-REFRESH --> RULESET
+        ScoredEvtProducer --> FactScoredRepo
+        FactScoredRepo --> Router
+        Router -->|score >= threshold| KafkaTopic4
+        Router -->|score < threshold| KafkaTopic5
+        ScoredEvtProducer --> KafkaTopic3
 
-TOPIC_IN -.->|"DeadLetterPublishingRecoverer\n(existing KafkaConsumerConfig)"| TOPIC_DLQ
+        TopicConfig -.creates.-> KafkaTopic3
+        TopicConfig -.creates.-> KafkaTopic4
+        TopicConfig -.creates.-> KafkaTopic5
+        TopicConfig -.creates.-> KafkaDLQ
 
-classDef kafka fill:#EEEDFE,stroke:#534AB7,color:#26215C
-classDef store fill:#FAECE7,stroke:#993C1D,color:#4A1B0C
-classDef service fill:#E6F1FB,stroke:#185FA5,color:#042C53
-classDef external fill:#F1EFE8,stroke:#5F5E5A,color:#2C2C2A
-classDef config fill:#E1F5EE,stroke:#0F6E56,color:#04342C
-classDef new fill:#FFF9E6,stroke:#B8860B,color:#3B2A00
+        KafkaConsumerCfg -.routes errors.-> KafkaDLQ
+    end
 
-class TOPIC_IN,TOPIC_DLQ,TOPIC_REVIEW,TOPIC_APPROVED,TOPIC_SCORED,BUS kafka
-class DW,REDIS,SRC_AUDIT,SCORED_DW store
-class CONSUMER,VALIDATOR,PROC,DIM,SCORED,METRICS,VELOCITY service
-class PROD,CASE,NOTIF,ANALYTICS external
-class CONFIG,REFRESH config
-class RULES,CTX,EVAL,RULESET new
+    subgraph VELOCITY["Velocity Service"]
+        direction TB
+        VelocityInterface["VelocityService<br/>(interface)"]
+        RedisVelocitySvc["RedisVelocityService<br/>@ConditionalOnProperty<br/>(velocity.redis.enabled=true)<br/>(Lua: ZADD+ZCOUNT)<br/>(10m/1h/24h windows)"]
+        NoOpVelocitySvc["NoOpVelocityService<br/>(fallback when disabled)<br/>(returns zeros)"]
+        CB["Resilience4j CircuitBreaker<br/>(velocity)"]
+        FallbackQuery["fallbackQuery<br/>(PostgreSQL DW)"]
+        VelocityFallbackDS["VelocityFallbackDataSourceConfig<br/>(HikariCP pool size=3)"]
+
+        VelocityInterface -.implemented by.-> RedisVelocitySvc
+        VelocityInterface -.implemented by.-> NoOpVelocitySvc
+        RedisVelocitySvc --> CB
+        CB -->|open| FallbackQuery
+        FallbackQuery --> VelocityFallbackDS
+    end
+
+    subgraph KAFKA["Kafka Cluster"]
+        KafkaTopic1["transaction-events<br/>(key: transactionId)<br/>(3 partitions)"]
+        KafkaTopic3["transaction.scored"]
+        KafkaTopic4["transaction.review"]
+        KafkaTopic5["transaction.approved"]
+        KafkaDLQ["transaction.dlq"]
+    end
+
+    subgraph POSTGRES["PostgreSQL"]
+        PaymentsDB["payments.transactions<br/>(source data)"]
+
+        subgraph RULES_SCHEMA["rules_engine schema"]
+            SrcTxnEvt["src_transaction_event<br/>(Kafka replay guard)"]
+            FactTxn["fact_transaction<br/>(VALID/INVALID status)"]
+            FactScored["fact_scored_transaction<br/>(score + matched_rules)"]
+
+            DimClient["dim_client<br/>(SCD-2)"]
+            DimAccount["dim_account<br/>(SCD-2)"]
+            DimMerchant["dim_merchant<br/>(SCD-2)"]
+            DimChannel["dim_payment_channel"]
+            DimAuth["dim_transaction_auth"]
+            DimCardAuth["dim_card_auth_status"]
+            DimBlacklist["dim_blacklisted_merchant"]
+
+            DWVelocityTable["fact_transaction<br/>(velocity fallback)"]
+        end
+    end
+
+    subgraph REDIS["Redis"]
+        RedisVelocityKeys["rules:velocity:{cifNr}<br/>(sorted sets)<br/>(TTL: 24h)"]
+    end
+
+    subgraph DOWNSTREAM["Downstream Consumers"]
+        CaseManagement["Case Management<br/>(transaction.review)"]
+        Notifications["Notifications<br/>(.review + .approved)"]
+        Analytics["Analytics<br/>(.scored)"]
+    end
+
+    subgraph METRICS["Observability"]
+        RulesEngMetrics["RulesEngineMetrics<br/>(Micrometer)<br/>(timers + counters)"]
+    end
+
+    TxnProducer --> KafkaTopic1
+    KafkaTopic1 --> KafkaListener
+
+    TxnRepo -.reads.-> PaymentsDB
+    SrcRepo -.writes.-> SrcTxnEvt
+    FactTxnRepoInvalid -.writes.-> FactTxn
+    FactTxnRepoValid -.writes.-> FactTxn
+    FactScoredRepo -.writes.-> FactScored
+
+    DimResSvc -.resolves.-> DimClient
+    DimResSvc -.resolves.-> DimAccount
+    DimResSvc -.resolves.-> DimMerchant
+    DimResSvc -.resolves.-> DimChannel
+    DimResSvc -.resolves.-> DimAuth
+    DimResSvc -.resolves.-> DimCardAuth
+
+    EvalCtxBuilder -.checks.-> DimBlacklist
+    EvalCtxBuilder -.queries.-> VelocityInterface
+
+    RedisVelocitySvc -.reads/writes.-> RedisVelocityKeys
+    FallbackQuery -.queries.-> DWVelocityTable
+
+    KafkaTopic3 --> Analytics
+    KafkaTopic4 --> CaseManagement
+    KafkaTopic4 --> Notifications
+    KafkaTopic5 --> Notifications
+
+    Validator -.emits.-> RulesEngMetrics
+    TxnProcSvc -.emits.-> RulesEngMetrics
+    RulesEngine -.emits.-> RulesEngMetrics
+    RedisVelocitySvc -.emits.-> RulesEngMetrics
+    ScoredEvtProducer -.emits.-> RulesEngMetrics
+
+    classDef kafka fill:#9370DB,stroke:#4B0082,color:#FFF
+    classDef store fill:#FF8C00,stroke:#D2691E,color:#FFF
+    classDef service fill:#4682B4,stroke:#27408B,color:#FFF
+    classDef external fill:#808080,stroke:#404040,color:#FFF
+    classDef config fill:#32CD32,stroke:#228B22,color:#FFF
+    classDef rules fill:#FFD700,stroke:#DAA520,color:#000
+    classDef producer fill:#20B2AA,stroke:#008B8B,color:#FFF
+    classDef metrics fill:#FF69B4,stroke:#C71585,color:#FFF
+
+    class KafkaTopic1,KafkaTopic3,KafkaTopic4,KafkaTopic5,KafkaDLQ kafka
+    class PaymentsDB,SrcTxnEvt,FactTxn,FactScored,DimClient,DimAccount,DimMerchant,DimChannel,DimAuth,DimCardAuth,DimBlacklist,DWVelocityTable,RedisVelocityKeys store
+    class KafkaListener,SrcMapper,Validator,TxnProcSvc,InvalidPath,ValidPath,DimResSvc,EvalCtxBuilder,ScoredEvtProducer,Router,VelocityInterface,RedisVelocitySvc,NoOpVelocitySvc,CB,FallbackQuery service
+    class CaseManagement,Notifications,Analytics external
+    class KafkaProducerCfg,AutoCreateCfg,KafkaConsumerCfg,TopicConfig,VelocityFallbackDS config
+    class RulesEngProps,RuleSetLoader,RuleSetValidator,RulesEngine,RulesRefreshListener,ConditionEval rules
+    class RestAPI,TxnRepo,TxnMapper,TxnProducer producer
+    class RulesEngMetrics metrics
